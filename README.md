@@ -1,10 +1,26 @@
 # Claude Usage Screen
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+![Python](https://img.shields.io/badge/Python-3.8%2B-blue.svg)
+![PySide6](https://img.shields.io/badge/GUI-PySide6-41cd52.svg)
+![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey.svg)
+
 A minimalist, monochrome **info screen** for a spare monitor or small HDMI
 display. It shows a big clock, your **Claude Code usage** (5‑hour session and
 weekly limits, as *% left* with reset times), and the current **weather**.
 
 ![screenshot](docs/screenshot.png)
+
+## Quick start
+
+```bash
+git clone git@github.com:AHMUJia/claude-usage.git
+cd claude-usage
+pip install PySide6              # + `pip install claude-usage-widget` for the usage cards
+python infoscreen.py --fullscreen
+```
+
+`F` / `F11` toggle fullscreen · `Esc` / `Q` quit.
 
 Built with PySide6 — a single Python file, no web stack, runs on
 Windows / macOS / Linux.
