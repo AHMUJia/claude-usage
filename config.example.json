@@ -1,0 +1,14 @@
+{
+  "weather_city": "",
+  "weather_refresh_seconds": 900,
+  "claude_refresh_seconds": 300,
+  "claude_usage_cmd": null,
+  "time_24h": true,
+  "fullscreen": false,
+  "frameless": false,
+  "width": 960,
+  "height": 640,
+  "session_label": "5H LIMIT",
+  "week_label": "WEEK LIMIT",
+  "font_family": "Bahnschrift"
+}
