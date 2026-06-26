@@ -1,6 +1,7 @@
 # Claude Usage Screen
 
 [中文](README.md) · **English**
+**v2** (current) · [v1](https://github.com/AHMUJia/claude-usage/blob/v1/README.en.md)
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 ![Python](https://img.shields.io/badge/Python-3.8%2B-blue.svg)
