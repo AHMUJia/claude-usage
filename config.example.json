@@ -10,5 +10,14 @@
   "height": 640,
   "session_label": "5H LIMIT",
   "week_label": "WEEK LIMIT",
-  "font_family": "Bahnschrift"
+  "font_family": "Bahnschrift",
+
+  "signal_enabled": true,
+  "signal_state_file": null,
+  "signal_poll_ms": 700,
+  "signal_show_idle": true,
+  "signal_completed_ttl": 60,
+  "signal_session_ttl": 1800,
+  "signal_review_ttl": 300,
+  "signal_problem_ttl": 3600
 }

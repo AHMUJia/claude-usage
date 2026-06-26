@@ -1,15 +1,25 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Claude Usage Screen — a minimalist, monochrome info display.
+Claude Usage Screen 2.0 — a minimalist, monochrome info display.
 
 A single full-screen panel showing:
   - a big HH:MM clock in a "viewfinder" frame
+  - a Claude Code "traffic light" (agent status) next to the clock: green when
+    Claude is idle / working, yellow for a notification, red when it needs your
+    permission or hit an error
   - your Claude Code usage as two cards: 5H LIMIT (current 5-hour session) and
     WEEK LIMIT (weekly, all models), each as "% LEFT" + a bar + the reset time
   - the current weather (icon + temperature + humidity) in the top-right
 
 Great as a desk clock on a spare monitor / small HDMI screen.
+
+The traffic light reads a small JSON status file that Claude Code hooks keep
+up to date (see `agent_signal_hook.py`). The status-file schema and the
+event -> signal mapping are compatible with the open-source project
+**ridyang/Agent-Signal-Bar** (https://github.com/ridyang/Agent-Signal-Bar) —
+all credit for the traffic-light concept goes there. If no status file exists,
+the light just stays steady green ("nothing to do").
 
 Dependencies:
   - PySide6                       (pip install PySide6)            -- required
@@ -26,15 +36,30 @@ CLI:    --city "Tokyo"  --fullscreen  --config path/to/config.json
 import os
 import sys
 import json
+import time
+import calendar
 import argparse
 import urllib.request
 
-from PySide6.QtCore import Qt, QTimer, QDateTime, QRectF, QThread, Signal, QProcess, QProcessEnvironment
+from PySide6.QtCore import (Qt, QTimer, QDateTime, QRectF, QThread, Signal,
+                            QProcess, QProcessEnvironment)
 from PySide6.QtGui import QFont, QFontMetrics, QPainter, QColor, QPen, QPolygonF
 from PySide6.QtCore import QPointF
 from PySide6.QtWidgets import QApplication, QWidget, QVBoxLayout
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+
+
+def default_state_file():
+    """Where the traffic-light status JSON lives (matches Agent Signal Bar)."""
+    env = os.environ.get("AGENT_SIGNAL_LIGHT_STATE_FILE")
+    if env:
+        return env
+    if os.name == "nt":
+        base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+        return os.path.join(base, "AgentSignalBar", "status.json")
+    return "/tmp/agent-signal/status.json"
+
 
 DEFAULTS = {
     # Weather (wttr.in). Empty city = auto-detect by your IP.
@@ -56,6 +81,21 @@ DEFAULTS = {
     # Font family (Windows ships "Bahnschrift" which gives the condensed look;
     # falls back to the platform default sans elsewhere).
     "font_family": "Bahnschrift",
+    # --- Claude traffic light (agent status) ---------------------------- #
+    # JSON file written by Claude Code hooks (see agent_signal_hook.py).
+    # null = auto per platform (see default_state_file()).
+    "signal_state_file": None,
+    "signal_enabled": True,
+    "signal_poll_ms": 700,            # how often to re-read the status file
+    "signal_show_idle": True,         # steady green when nothing is running
+    # Per-state "how long the light is kept when no newer event arrives" (s).
+    # Aggregation is newest-wins: the light follows your most recent action;
+    # these only matter once a session goes quiet.
+    "signal_completed_ttl": 60,       # green "done" -> idle after 60s
+    "signal_session_ttl": 1800,       # stuck working/idle dropped after 30min
+    "signal_review_ttl": 300,         # yellow notification auto-clears after 5min
+    "signal_problem_ttl": 3600,       # red (permission/blocked) kept up to 1h so
+                                      # you still see the alert after stepping away
 }
 
 
@@ -113,6 +153,169 @@ def _wcode_to_cond(code):
 
 
 # --------------------------------------------------------------------------- #
+#  Claude traffic light                                                        #
+# --------------------------------------------------------------------------- #
+# Reads the status.json kept up to date by Claude Code hooks. The schema and the
+# signal -> state mapping match ridyang/Agent-Signal-Bar.
+SIG_DISPLAY = {
+    "idle": "ready", "session_start": "ready", "session_end": "ready", "turn_end": "ready",
+    "thinking": "active", "working": "active", "tool_done": "active",
+    "subagent_start": "active", "subagent_stop": "active",
+    "done": "completed",
+    "attention": "needs_review", "notification": "needs_review",
+    "permission": "permission", "permission_request": "permission",
+    "blocked": "blocked", "failure": "blocked", "error": "blocked",
+    "exception": "blocked", "max_tokens": "blocked",
+    "stale": "stale", "off": "paused", "pause": "paused", "paused": "paused",
+}
+# display state -> (lamp index 0=red/1=yellow/2=green, flash none/slow/fast)
+# All steady (none) by design — a blinking light is distracting on a desk.
+SIG_LOOK = {
+    "ready":        (2, "none"),
+    "active":       (2, "none"),
+    "completed":    (2, "none"),
+    "needs_review": (1, "none"),
+    "permission":   (0, "none"),
+    "blocked":      (0, "none"),
+    "stale":        (1, "none"),
+    "paused":       (1, "none"),
+}
+SIG_LAMP_RGB = ["#ff453a", "#ffd60a", "#32d74b"]   # red / yellow / green
+
+
+def _sig_parse_iso(s):
+    """'2026-06-26T13:19:53Z' -> epoch seconds; 0 on failure."""
+    try:
+        return calendar.timegm(time.strptime(s, "%Y-%m-%dT%H:%M:%SZ"))
+    except Exception:
+        return 0.0
+
+
+class SignalLight(QWidget):
+    """A three-lamp traffic light reflecting this machine's Claude Code state."""
+
+    def __init__(self, cfg, parent=None):
+        super().__init__(parent)
+        self.cfg = cfg
+        self.path = cfg.get("signal_state_file") or default_state_file()
+        self.completed_ttl = int(cfg.get("signal_completed_ttl", 60))
+        self.session_ttl = int(cfg.get("signal_session_ttl", 1800))
+        self.review_ttl = int(cfg.get("signal_review_ttl", 300))
+        self.problem_ttl = int(cfg.get("signal_problem_ttl", 3600))
+        self.show_idle = bool(cfg.get("signal_show_idle", True))
+        # Per-state expiry (see DEFAULTS). Anything not listed uses session_ttl.
+        self._ttl = {
+            "completed": self.completed_ttl,
+            "needs_review": self.review_ttl,
+            "permission": self.problem_ttl,
+            "blocked": self.problem_ttl,
+        }
+        self.disp = "ready"
+        self.sig = "idle"
+        self.flash = "none"
+        self.lamp = 2
+        self.nsess = 0
+        self._fail = 0
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.poll = QTimer(self)
+        self.poll.timeout.connect(self.refresh)
+        self.poll.start(max(200, int(cfg.get("signal_poll_ms", 700))))
+        self.blink = QTimer(self)
+        self.blink.timeout.connect(self._tick)
+        self.blink.start(130)
+        QTimer.singleShot(300, self.refresh)
+
+    def _tick(self):
+        if self.flash != "none":          # only flashing states need fast repaint
+            self.update()
+
+    def refresh(self):
+        disp, sig, n = self._read()
+        if (disp, sig, n) != (self.disp, self.sig, self.nsess):
+            self.disp, self.sig, self.nsess = disp, sig, n
+            self.lamp, self.flash = SIG_LOOK.get(disp, SIG_LOOK["ready"])
+            self.update()
+
+    def _read(self):
+        """status.json -> (display_state, signal, active session count).
+
+        Aggregation is newest-wins: among non-expired sessions, the one updated
+        most recently drives the light. Expiry (self._ttl) is only a fallback for
+        when a session goes quiet, so a stale notification/error does not linger
+        forever (but a real red alert is kept up to problem_ttl)."""
+        if not self.path or not os.path.exists(self.path):
+            self._fail = 0
+            return ("ready", "idle", 0)
+        try:
+            with open(self.path, "r", encoding="utf-8") as f:
+                d = json.load(f)
+            self._fail = 0
+        except Exception:
+            # may have hit the atomic write mid-flight; only after a few
+            # consecutive failures do we call it stale
+            self._fail += 1
+            if self._fail >= 3:
+                return ("stale", "stale", self.nsess)
+            return (self.disp, self.sig, self.nsess)
+        now = time.time()
+        best = None   # (updated_epoch, disp, sig)
+        nact = 0
+        for s in (d.get("sessions") or {}).values():
+            sig = s.get("signal")
+            disp = SIG_DISPLAY.get(sig)
+            if disp is None:
+                continue
+            ts = _sig_parse_iso(s.get("updated_at", ""))
+            if now - ts > self._ttl.get(disp, self.session_ttl):
+                continue
+            nact += 1
+            if best is None or ts > best[0]:
+                best = (ts, disp, sig)
+        if best is None:
+            return ("ready", "idle", 0)
+        return (best[1], best[2], nact)
+
+    def paintEvent(self, _e):
+        W, H = self.width(), self.height()
+        if W < 20 or H < 20:
+            return
+        if self.disp == "ready" and not self.show_idle:
+            return
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        d = min(H * 0.44, W * 0.21)             # lamp diameter
+        gap = d * 0.44
+        lamps_w = 3 * d + 2 * gap
+        x0 = (W - lamps_w) / 2.0
+        cy = H / 2.0
+        # housing
+        pad = d * 0.30
+        hh = d + pad * 1.5
+        hrect = QRectF(x0 - pad, cy - hh / 2, lamps_w + 2 * pad, hh)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(255, 255, 255, 22))
+        p.drawRoundedRect(hrect, hh * 0.5, hh * 0.5)
+        # three lamps
+        for i in range(3):
+            cx = x0 + d / 2 + i * (d + gap)
+            base = QColor(SIG_LAMP_RGB[i])
+            lit = (i == self.lamp)
+            if lit:
+                glow = QColor(base); glow.setAlpha(85)
+                p.setBrush(glow); p.setPen(Qt.PenStyle.NoPen)
+                p.drawEllipse(QRectF(cx - d * 0.72, cy - d * 0.72, d * 1.44, d * 1.44))
+                col = base
+            else:
+                col = QColor(base).darker(360)
+                col.setAlpha(150)
+            p.setBrush(col)
+            p.setPen(QPen(QColor(0, 0, 0, 120), max(1, d * 0.06)))
+            p.drawEllipse(QRectF(cx - d / 2, cy - d / 2, d, d))
+
+
+# --------------------------------------------------------------------------- #
 #  The info panel                                                              #
 # --------------------------------------------------------------------------- #
 class InfoPage(QWidget):
@@ -146,6 +349,24 @@ class InfoPage(QWidget):
         self.wtimer.timeout.connect(self.refresh_weather)
         self.wtimer.start(max(300, int(cfg["weather_refresh_seconds"])) * 1000)
         QTimer.singleShot(1500, self.refresh_weather)
+
+        # Claude traffic light — a transparent child overlaid on the right of the
+        # clock; positioned in resizeEvent so clock + light read as one group.
+        self.signal = None
+        if cfg.get("signal_enabled", True):
+            self.signal = SignalLight(cfg, self)
+            self.signal.show()
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        if not self.signal:
+            return
+        W, H = self.width(), self.height()
+        # Centered group inside the full-width viewfinder: clock box (gx + 0.34W)
+        # + gap 0.025W + light box 0.40W. Keep in sync with paintEvent.
+        self.signal.setGeometry(int(W * (0.1175 + 0.34 + 0.025)), int(H * 0.145),
+                                int(W * 0.40), int(H * 0.32))
+        self.signal.raise_()
 
     # ---- data ------------------------------------------------------------- #
     def _claude_cmd(self):
@@ -321,13 +542,23 @@ class InfoPage(QWidget):
         ic = bar_h * 1.3
         self._weather_icon(p, rx - ic, bar_y + bar_h / 2 - ic / 2, ic, self.wcond or "cloud")
 
-        # ---- clock + viewfinder ----
+        # ---- clock (+ traffic light) inside the viewfinder ----
+        # Full-width viewfinder; the clock sits in the left half of a centered
+        # group and the traffic-light child (resizeEvent) in the right half.
         fx, fw = M, W - 2 * M
         fy, fh = H * 0.145, H * 0.32
         fmt = "HH:mm" if self.cfg.get("time_24h", True) else "h:mm"
         p.setPen(WHITE)
-        p.setFont(self._font(fh * 0.80, bold=True))
-        p.drawText(QRectF(fx, fy, fw, fh), int(Qt.AlignmentFlag.AlignCenter), now.toString(fmt))
+        if self.signal:
+            gx = W * 0.1175                       # left edge of the centered group
+            cbx, cbw = gx, W * 0.34               # clock box
+            p.setFont(self._font(min(fh * 0.80, cbw * 0.38), bold=True))
+            p.drawText(QRectF(cbx, fy, cbw, fh), int(Qt.AlignmentFlag.AlignCenter),
+                       now.toString(fmt))
+        else:
+            p.setFont(self._font(fh * 0.80, bold=True))
+            p.drawText(QRectF(fx, fy, fw, fh), int(Qt.AlignmentFlag.AlignCenter),
+                       now.toString(fmt))
         cl = min(fw, fh) * 0.16
         pen = QPen(WHITE, max(3, int(H * 0.007)))
         pen.setCapStyle(Qt.PenCapStyle.FlatCap)
